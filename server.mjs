@@ -499,10 +499,122 @@ function createMcpServer() {
     }
   );
 
-  // Tool 9: Run custom SQL
+  // Tool 9: Search FDA Purple Book (licensed biological products)
+  mcp.tool(
+    "search_biologics",
+    "Search the FDA Purple Book — licensed biological products (BLAs), including proprietary name, proper name, applicant, BLA number, dosage form, route, strength, license type, and marketing status. Use for biosimilars, interchangeable products, vaccines, and other licensed biologics.",
+    {
+      query: z.string().optional().describe("Search across proprietary name, proper name, applicant, BLA number, and route (partial match)"),
+      license_type: z.string().optional().describe("Filter by license type (e.g., 351(a), 351(k) biosimilar, 351(k) interchangeable)"),
+      marketing_status: z.string().optional().describe("Filter by marketing status"),
+      limit: z.number().optional().default(20).describe("Max results (default 20, max 100)"),
+    },
+    async ({ query, license_type, marketing_status, limit }) => {
+      const conditions = [];
+      const params = [];
+      let paramIdx = 1;
+
+      if (query) {
+        const q = `%${query}%`;
+        conditions.push(`(
+          pb.proprietary_name ILIKE $${paramIdx}
+          OR pb.proper_name ILIKE $${paramIdx}
+          OR pb.applicant ILIKE $${paramIdx}
+          OR pb.bla_number ILIKE $${paramIdx}
+          OR pb.route ILIKE $${paramIdx}
+        )`);
+        params.push(q);
+        paramIdx++;
+      }
+      if (license_type) {
+        conditions.push(`pb.license_type ILIKE $${paramIdx}`);
+        params.push(`%${license_type}%`);
+        paramIdx++;
+      }
+      if (marketing_status) {
+        conditions.push(`pb.marketing_status ILIKE $${paramIdx}`);
+        params.push(`%${marketing_status}%`);
+        paramIdx++;
+      }
+
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      const safeLimit = Math.min(Math.max(limit || 20, 1), 100);
+
+      const res = await pool.query(
+        `
+        SELECT pb.bla_number, pb.proprietary_name, pb.proper_name, pb.applicant,
+               pb.dosage_form, pb.route, pb.strength, pb.marketing_status,
+               pb.license_type, pb.approval_date, pb.exclusivity_expiration
+        FROM purple_book pb
+        ${where}
+        ORDER BY pb.proprietary_name NULLS LAST, pb.bla_number
+        LIMIT ${safeLimit}
+        `,
+        params
+      );
+
+      if (res.rows.length === 0) {
+        return { content: [{ type: "text", text: "No Purple Book biologics found matching your criteria." }] };
+      }
+
+      const summary = res.rows
+        .map(
+          (r) =>
+            `${r.bla_number || "?"} | ${r.proprietary_name || "?"} | ${r.proper_name || "?"} | ${r.applicant || "?"} | ${r.route || "—"} | ${r.marketing_status || "?"} | ${r.license_type || "—"}`
+        )
+        .join("\n");
+
+      return {
+        content: [{ type: "text", text: `Found ${res.rows.length} Purple Book rows:\n\n${summary}` }],
+      };
+    }
+  );
+
+  // Tool 10: Purple Book aggregate statistics
+  mcp.tool(
+    "get_biologics_statistics",
+    "Aggregate FDA Purple Book data by applicant, license type, route of administration, or marketing status. Use for questions like which applicants have the most licensed biologics or how products split by license type.",
+    {
+      group_by: z.enum(["applicant", "license_type", "route", "marketing_status"]).describe("Dimension to group by"),
+      limit: z.number().optional().default(25).describe("Max groups to return (default 25, max 100)"),
+    },
+    async ({ group_by, limit }) => {
+      const safeLimit = Math.min(Math.max(limit || 25, 1), 100);
+      const col =
+        group_by === "applicant"
+          ? "pb.applicant"
+          : group_by === "license_type"
+            ? "pb.license_type"
+            : group_by === "route"
+              ? "pb.route"
+              : "pb.marketing_status";
+
+      const res = await pool.query(
+        `
+        SELECT ${col} AS group_key, COUNT(*)::int AS count
+        FROM purple_book pb
+        WHERE ${col} IS NOT NULL AND TRIM(${col}) != ''
+        GROUP BY group_key
+        ORDER BY count DESC
+        LIMIT ${safeLimit}
+        `
+      );
+
+      if (res.rows.length === 0) {
+        return { content: [{ type: "text", text: "No Purple Book data to aggregate (table may be empty)." }] };
+      }
+
+      const text = res.rows.map((r) => `${r.group_key}: ${r.count}`).join("\n");
+      return {
+        content: [{ type: "text", text: `Purple Book grouped by ${group_by}:\n\n${text}` }],
+      };
+    }
+  );
+
+  // Tool 11: Run custom SQL
   mcp.tool(
     "run_query",
-    "Run a read-only SQL query against the regulatory database. Tables: applications (application_number, sponsor_name, application_type, brand_name, generic_name, manufacturer_name, substance_name, pharm_class, route), products (application_number, marketing_status, dosage_form, active_ingredients), submissions (application_number, submission_type, submission_number, submission_status, submission_status_date, submission_class_code_description, submission_public_notes), complete_response_letters (application_number, letter_date, company_name, letter_type, letter_text, approver_name), federal_register (document_number, title, doc_type, abstract, publication_date, html_url, agencies), usda_permits (permit_number, status, organism, phenotype, developer, permit_type, release_type, effective_date, state). Only SELECT queries are allowed.",
+    "Run a read-only SQL query against the regulatory database. Tables: applications (application_number, sponsor_name, application_type, brand_name, generic_name, manufacturer_name, substance_name, pharm_class, route), products (application_number, marketing_status, dosage_form, active_ingredients), submissions (application_number, submission_type, submission_number, submission_status, submission_status_date, submission_class_code_description, submission_public_notes), complete_response_letters (application_number, letter_date, company_name, letter_type, letter_text, approver_name), federal_register (document_number, title, doc_type, abstract, publication_date, html_url, agencies), usda_permits (permit_number, status, organism, phenotype, developer, permit_type, release_type, effective_date, state), purple_book (bla_number, proprietary_name, proper_name, applicant, dosage_form, route, strength, marketing_status, license_type, approval_date, exclusivity_expiration, raw_row). Only SELECT queries are allowed.",
     {
       sql: z.string().describe("A SELECT SQL query"),
     },
