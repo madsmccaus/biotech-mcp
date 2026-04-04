@@ -656,6 +656,20 @@ app.use(express.json());
 // Health check
 app.get("/health", (req, res) => res.send("ok"));
 
+app.post("/api/apify/ingest", async (req, res) => {
+  const incomingSecret = req.headers["x-ingest-secret"];
+  const expectedSecret = process.env.APIFY_INGEST_SECRET;
+
+  if (!expectedSecret || incomingSecret !== expectedSecret) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+
+  console.log("Apify webhook received");
+  console.log(req.body);
+
+  return res.json({ ok: true });
+});
+
 // MCP endpoint — stateless: new transport + server per request
 app.post("/mcp", async (req, res) => {
   try {
