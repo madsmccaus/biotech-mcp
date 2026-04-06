@@ -292,7 +292,6 @@ function createMcpServer() {
       const summary = res.rows.map(r => {
         let entry = `${r.application_number || "?"} | ${r.company_name} | Date: ${r.letter_date}\n`;
         if (r.letter_excerpt) {
-          // Clean up OCR artifacts and show first ~500 chars
           const clean = r.letter_excerpt.replace(/\n{3,}/g, "\n\n").trim().slice(0, 500);
           entry += `  Excerpt: ${clean}...\n`;
         }
@@ -611,10 +610,120 @@ function createMcpServer() {
     }
   );
 
-  // Tool 11: Run custom SQL
+  // Tool 11: Search EPA biotech submissions (MCANs, TERAs, TMEAs)
+  mcp.tool(
+    "search_epa_biotech",
+    "Search EPA OCSPP biotechnology submissions including Microbial Commercial Activity Notices (MCANs), TSCA Environmental Release Applications (TERAs), Test Market Exemption Applications (TMEAs), and related biotech regulatory actions. Covers TSCA biotech notifications and FIFRA biopesticide activity.",
+    {
+      query: z.string().optional().describe("Free text search across case number, organism, submitter, disposition, and page content"),
+      submission_type: z.enum(["MCAN", "TERA", "TMEA", "any"]).optional().default("any").describe("Filter by submission type"),
+      status: z.string().optional().describe("Filter by status/disposition, e.g. 'not likely to present unreasonable risk', 'consent order', 'pending'"),
+      limit: z.number().optional().default(25).describe("Max results to return"),
+    },
+    async ({ query, submission_type, status, limit }) => {
+      let where = [];
+      let params = [];
+      let p = 1;
+
+      if (submission_type && submission_type !== "any") {
+        where.push(`submission_type = $${p++}`);
+        params.push(submission_type);
+      }
+      if (status) {
+        where.push(`disposition ILIKE $${p++}`);
+        params.push(`%${status}%`);
+      }
+      if (query) {
+        where.push(`(
+          case_number ILIKE $${p} OR
+          organism ILIKE $${p} OR
+          submitter ILIKE $${p} OR
+          disposition ILIKE $${p} OR
+          page_text ILIKE $${p}
+        )`);
+        params.push(`%${query}%`);
+        p++;
+      }
+
+      const whereClause = where.length > 0 ? "WHERE " + where.join(" AND ") : "";
+      const sql = `SELECT case_number, submission_type, received_date, organism, submitter,
+                          interim_status, disposition, effective_date, source_url
+                   FROM epa_biotech_submissions
+                   ${whereClause}
+                   ORDER BY received_date DESC NULLS LAST
+                   LIMIT $${p}`;
+      params.push(Math.min(Math.max(limit || 25, 1), 100));
+
+      try {
+        const res = await pool.query(sql, params);
+        if (res.rows.length === 0) {
+          return { content: [{ type: "text", text: "No EPA biotech submissions found matching those criteria." }] };
+        }
+
+        const summary = res.rows.map(r => {
+          let entry = `${r.case_number} (${r.submission_type})`;
+          if (r.received_date) entry += ` | Received: ${r.received_date}`;
+          if (r.organism) entry += ` | Organism: ${r.organism}`;
+          if (r.submitter) entry += ` | Submitter: ${r.submitter}`;
+          if (r.disposition) entry += `\n  Disposition: ${r.disposition}`;
+          if (r.effective_date) entry += ` (${r.effective_date})`;
+          if (r.source_url) entry += `\n  ${r.source_url}`;
+          return entry;
+        }).join("\n\n");
+
+        return { content: [{ type: "text", text: `Found ${res.rows.length} EPA biotech submissions:\n\n${summary}` }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Query error: ${e.message}` }] };
+      }
+    }
+  );
+
+  // Tool 12: EPA biotech statistics
+  mcp.tool(
+    "get_epa_biotech_statistics",
+    "Get aggregate statistics on EPA OCSPP biotech submissions — counts by type, disposition, year, etc.",
+    {
+      group_by: z.enum(["submission_type", "disposition", "year", "submitter"]).optional().default("submission_type"),
+    },
+    async ({ group_by }) => {
+      let sql;
+      switch (group_by) {
+        case "year":
+          sql = `SELECT EXTRACT(YEAR FROM received_date::date) as year, COUNT(*) as count
+                 FROM epa_biotech_submissions
+                 WHERE received_date IS NOT NULL
+                 GROUP BY year ORDER BY year DESC`;
+          break;
+        case "submitter":
+          sql = `SELECT submitter, COUNT(*) as count
+                 FROM epa_biotech_submissions
+                 WHERE submitter IS NOT NULL AND submitter != ''
+                 GROUP BY submitter ORDER BY count DESC LIMIT 20`;
+          break;
+        default:
+          sql = `SELECT ${group_by}, COUNT(*) as count
+                 FROM epa_biotech_submissions
+                 GROUP BY ${group_by} ORDER BY count DESC`;
+      }
+
+      try {
+        const res = await pool.query(sql);
+        const total = await pool.query("SELECT COUNT(*) FROM epa_biotech_submissions");
+        const lines = res.rows.map(r => {
+          const key = r[group_by] || r.year || "(unknown)";
+          return `  ${key}: ${r.count}`;
+        }).join("\n");
+        return { content: [{ type: "text", text: `EPA Biotech Submissions — ${total.rows[0].count} total\n\nBy ${group_by}:\n${lines}` }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Query error: ${e.message}` }] };
+      }
+    }
+  );
+
+  // Tool 13: Run custom SQL
   mcp.tool(
     "run_query",
-    "Run a read-only SQL query against the regulatory database. Tables: applications (application_number, sponsor_name, application_type, brand_name, generic_name, manufacturer_name, substance_name, pharm_class, route), products (application_number, marketing_status, dosage_form, active_ingredients), submissions (application_number, submission_type, submission_number, submission_status, submission_status_date, submission_class_code_description, submission_public_notes), complete_response_letters (application_number, letter_date, company_name, letter_type, letter_text, approver_name), federal_register (document_number, title, doc_type, abstract, publication_date, html_url, agencies), usda_permits (permit_number, status, organism, phenotype, developer, permit_type, release_type, effective_date, state), purple_book (bla_number, proprietary_name, proper_name, applicant, dosage_form, route, strength, marketing_status, license_type, approval_date, exclusivity_expiration, raw_row). Only SELECT queries are allowed.",
+    "Run a read-only SQL query against the regulatory database. Tables: applications (application_number, sponsor_name, application_type, brand_name, generic_name, manufacturer_name, substance_name, pharm_class, route), products (application_number, marketing_status, dosage_form, active_ingredients), submissions (application_number, submission_type, submission_number, submission_status, submission_status_date, submission_class_code_description, submission_public_notes), complete_response_letters (application_number, letter_date, company_name, letter_type, letter_text, approver_name), federal_register (document_number, title, doc_type, abstract, publication_date, html_url, agencies), usda_permits (permit_number, status, organism, phenotype, developer, permit_type, release_type, effective_date, state), purple_book (bla_number, proprietary_name, proper_name, applicant, dosage_form, route, strength, marketing_status, license_type, approval_date, exclusivity_expiration, raw_row), epa_biotech_submissions (case_number, submission_type, received_date, organism, submitter, interim_status, disposition, effective_date, source_url). Only SELECT queries are allowed.",
     {
       sql: z.string().describe("A SELECT SQL query"),
     },
@@ -651,7 +760,7 @@ function createMcpServer() {
 // ── Express App ──
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 // Health check
 app.get("/health", (req, res) => res.send("ok"));
@@ -713,6 +822,120 @@ app.delete("/mcp", (req, res) => {
     id: null,
   }));
 });
+
+// ── Apify Webhook: receive crawled EPA data ──
+
+app.post("/api/apify/ingest", async (req, res) => {
+  const secret = req.headers["x-ingest-secret"];
+  if (!secret || secret !== process.env.APIFY_INGEST_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    const body = req.body;
+
+    // Apify webhook sends run metadata with a dataset ID
+    const datasetId = body?.resource?.defaultDatasetId;
+    if (!datasetId) {
+      return res.status(400).json({ error: "No dataset ID found in webhook payload. Make sure the payload template is set to {{resource}}" });
+    }
+
+    // Fetch the crawled pages from the Apify dataset
+    const apifyToken = process.env.APIFY_API_TOKEN;
+    if (!apifyToken) {
+      return res.status(500).json({ error: "APIFY_API_TOKEN not configured on server" });
+    }
+
+    const apifyRes = await fetch(
+      `https://api.apify.com/v2/datasets/${datasetId}/items?format=json`,
+      { headers: { "Authorization": `Bearer ${apifyToken}` } }
+    );
+
+    if (!apifyRes.ok) {
+      console.error("Failed to fetch Apify dataset:", apifyRes.status);
+      return res.status(502).json({ error: "Failed to fetch Apify dataset" });
+    }
+
+    const items = await apifyRes.json();
+    const count = await processApifyItems(items);
+    console.log(`Apify ingest complete: ${items.length} pages, ${count} records inserted/updated`);
+    return res.json({ ok: true, pages: items.length, inserted: count });
+
+  } catch (e) {
+    console.error("Ingest error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+async function processApifyItems(items) {
+  let inserted = 0;
+
+  for (const item of items) {
+    const url = item.url || "";
+    const text = item.text || item.markdown || "";
+    if (!text) continue;
+
+    // Look for MCAN/TERA case numbers in markdown table rows: | J-17-0007 | ... |
+    const tableRowRegex = /^\|?\s*([JR]-\d{2}-\d{4})\s*\|/gm;
+    let match;
+
+    while ((match = tableRowRegex.exec(text)) !== null) {
+      const lineStart = text.lastIndexOf("\n", match.index) + 1;
+      const lineEnd = text.indexOf("\n", match.index);
+      const line = text.slice(lineStart, lineEnd === -1 ? undefined : lineEnd).trim();
+
+      const cells = line.split("|").map(c => c.trim()).filter(c => c);
+      if (cells.length < 3) continue;
+
+      const caseNumber = cells[0] || "";
+      const submissionType = caseNumber.startsWith("J") ? "MCAN"
+                           : caseNumber.startsWith("R") ? "TERA" : "OTHER";
+      const receivedDate = cells[1] || null;
+      const interimStatus = cells[2] || "";
+      const disposition = cells.length >= 5 ? cells[4] || cells[3] || "" : cells[3] || "";
+      const effectiveDate = cells[cells.length - 1] || null;
+
+      try {
+        await pool.query(
+          `INSERT INTO epa_biotech_submissions
+           (case_number, submission_type, received_date, interim_status, disposition, effective_date, source_url, page_text)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (case_number) DO UPDATE SET
+             disposition = EXCLUDED.disposition,
+             effective_date = EXCLUDED.effective_date,
+             interim_status = EXCLUDED.interim_status`,
+          [caseNumber, submissionType, receivedDate, interimStatus,
+           disposition, effectiveDate, url, text.slice(0, 5000)]
+        );
+        inserted++;
+      } catch (e) {
+        console.error("Insert error for", caseNumber, ":", e.message);
+      }
+    }
+
+    // If no table rows found but the page has biotech content, store it as a document
+    const isBiotechPage = /\b(MCAN|TERA|TMEA|biotech|microbial|biopesticide|experimental use permit)\b/i.test(text);
+    if (isBiotechPage && inserted === 0) {
+      try {
+        const docKey = `PAGE-${Buffer.from(url).toString("base64").slice(0, 40)}`;
+        await pool.query(
+          `INSERT INTO epa_biotech_submissions
+           (case_number, submission_type, source_url, page_text)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (case_number) DO UPDATE SET page_text = EXCLUDED.page_text`,
+          [docKey, "DOCUMENT", url, text.slice(0, 50000)]
+        );
+        inserted++;
+      } catch (e) {
+        console.error("Page insert error:", e.message);
+      }
+    }
+  }
+
+  return inserted;
+}
+
+// ── Start server ──
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
