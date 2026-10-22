@@ -1,0 +1,29 @@
+[
+  {
+    "document_number": "2026-00001",
+    "title": "First title",
+    "type": "Notice",
+    "publication_date": "2026-01-15",
+    "abstract": "Request for comments on digital assets.",
+    "agencies": [{ "name": "Securities and Exchange Commission" }],
+    "html_url": "https://example.com/a"
+  },
+  {
+    "document_number": "2026-00001",
+    "title": "Duplicate should be replaced",
+    "type": "Notice",
+    "publication_date": "2026-01-15",
+    "abstract": "Request for comments on digital assets.",
+    "agencies": [{ "name": "Securities and Exchange Commission" }],
+    "html_url": "https://example.com/b"
+  },
+  {
+    "document_number": "2026-00002",
+    "title": "Enforcement action",
+    "type": "Notice",
+    "publication_date": "2026-01-20",
+    "abstract": "SEC enforcement action for cryptocurrency fraud.",
+    "agencies": [{ "name": "Securities and Exchange Commission" }],
+    "html_url": "https://example.com/c"
+  }
+]

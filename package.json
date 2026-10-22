@@ -4,7 +4,10 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "ingest": "node ingest.mjs"
+    "ingest": "node ingest.mjs",
+    "test": "node --test test/**/*.test.mjs",
+    "signal:ingest": "node ingest-signal-fr.mjs",
+    "signal:score": "node score-signal.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
