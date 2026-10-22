@@ -720,10 +720,151 @@ function createMcpServer() {
     }
   );
 
+  // Signal: agency crypto policy track (legislative track stored separately when available)
+  mcp.tool(
+    "get_signal_reading",
+    "Get the latest Signal readings for U.S. federal crypto policy. Agency and legislative tracks are separate 0–100 scores; never blended. Returns latest agency value plus 30-day trend. Legislative track is not yet populated.",
+    {
+      track: z.enum(["agency", "legislative", "both"]).optional().default("agency"),
+    },
+    async ({ track }) => {
+      const lines = [];
+
+      if (track === "agency" || track === "both") {
+        const latest = await pool.query(
+          `SELECT reading_date, value FROM signal_readings
+           WHERE track = 'agency' ORDER BY reading_date DESC LIMIT 1`
+        );
+        if (latest.rows.length === 0) {
+          lines.push("Agency track: no readings yet (run ingest-signal-fr.mjs and score-signal.mjs).");
+        } else {
+          const { reading_date, value } = latest.rows[0];
+          const trend = await pool.query(
+            `SELECT reading_date, value FROM signal_readings
+             WHERE track = 'agency' AND reading_date >= ($1::date - INTERVAL '30 days')
+             ORDER BY reading_date ASC`,
+            [reading_date]
+          );
+          const first = trend.rows[0]?.value;
+          const last = trend.rows[trend.rows.length - 1]?.value;
+          const delta =
+            first != null && last != null ? (Number(last) - Number(first)).toFixed(2) : "n/a";
+          lines.push(`Agency track (0–100): ${Number(value).toFixed(2)} as of ${reading_date}`);
+          lines.push(`30-day trend: ${delta} (${trend.rows.length} daily points)`);
+          if (trend.rows.length > 1) {
+            const spark = trend.rows
+              .slice(-7)
+              .map((r) => `${r.reading_date}: ${Number(r.value).toFixed(1)}`)
+              .join(" | ");
+            lines.push(`Recent: ${spark}`);
+          }
+        }
+      }
+
+      if (track === "legislative" || track === "both") {
+        const leg = await pool.query(
+          `SELECT reading_date, value FROM signal_readings
+           WHERE track = 'legislative' ORDER BY reading_date DESC LIMIT 1`
+        );
+        if (leg.rows.length === 0) {
+          lines.push(
+            "Legislative track: not yet available (future: Congress.gov API + prediction-market odds)."
+          );
+        } else {
+          lines.push(
+            `Legislative track: ${Number(leg.rows[0].value).toFixed(2)} as of ${leg.rows[0].reading_date}`
+          );
+        }
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  mcp.tool(
+    "search_signal_events",
+    "Search Signal agency-track Federal Register events (crypto-related SEC, CFTC, Treasury, etc.). Filter by text, agency, and publication date range.",
+    {
+      query: z.string().optional().describe("Search title and abstract"),
+      agency: z.string().optional().describe("Filter agency name (partial match)"),
+      date_from: z.string().optional().describe("Publication date from (YYYY-MM-DD)"),
+      date_to: z.string().optional().describe("Publication date to (YYYY-MM-DD)"),
+      classification: z
+        .enum(["supportive", "restrictive", "neutral", "any"])
+        .optional()
+        .default("any"),
+      limit: z.number().optional().default(20),
+    },
+    async ({ query, agency, date_from, date_to, classification, limit }) => {
+      const conditions = [];
+      const params = [];
+      let p = 1;
+
+      if (query) {
+        conditions.push(`(title ILIKE $${p} OR abstract ILIKE $${p})`);
+        params.push(`%${query}%`);
+        p++;
+      }
+      if (agency) {
+        conditions.push(`agency ILIKE $${p}`);
+        params.push(`%${agency}%`);
+        p++;
+      }
+      if (date_from) {
+        conditions.push(`publication_date >= $${p}::date`);
+        params.push(date_from);
+        p++;
+      }
+      if (date_to) {
+        conditions.push(`publication_date <= $${p}::date`);
+        params.push(date_to);
+        p++;
+      }
+      if (classification && classification !== "any") {
+        conditions.push(`classification = $${p}`);
+        params.push(classification);
+        p++;
+      }
+
+      const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+      const safeLimit = Math.min(Math.max(limit || 20, 1), 100);
+
+      try {
+        const res = await pool.query(
+          `SELECT document_number, agency, type, title, publication_date,
+                  classification, score_delta, rationale, url
+           FROM signal_events ${where}
+           ORDER BY publication_date DESC NULLS LAST
+           LIMIT ${safeLimit}`,
+          params
+        );
+
+        if (res.rows.length === 0) {
+          return { content: [{ type: "text", text: "No Signal events matched." }] };
+        }
+
+        const text = res.rows
+          .map((r) => {
+            const date = r.publication_date
+              ? new Date(r.publication_date).toISOString().slice(0, 10)
+              : "?";
+            return `${date} | ${r.classification} (${r.score_delta}) | ${r.agency} | ${r.type}\n  ${r.title}\n  ${r.rationale}\n  ${r.url || ""}`;
+          })
+          .join("\n\n");
+
+        return {
+          content: [{ type: "text", text: `Found ${res.rows.length} events:\n\n${text}` }],
+        };
+      } catch (e) {
+        return { content: [{ type: "text", text: `Query error: ${e.message}` }] };
+      }
+    }
+  );
+
   // Tool 13: Run custom SQL
   mcp.tool(
     "run_query",
-    "Run a read-only SQL query against the regulatory database. Tables: applications (application_number, sponsor_name, application_type, brand_name, generic_name, manufacturer_name, substance_name, pharm_class, route), products (application_number, marketing_status, dosage_form, active_ingredients), submissions (application_number, submission_type, submission_number, submission_status, submission_status_date, submission_class_code_description, submission_public_notes), complete_response_letters (application_number, letter_date, company_name, letter_type, letter_text, approver_name), federal_register (document_number, title, doc_type, abstract, publication_date, html_url, agencies), usda_permits (permit_number, status, organism, phenotype, developer, permit_type, release_type, effective_date, state), purple_book (bla_number, proprietary_name, proper_name, applicant, dosage_form, route, strength, marketing_status, license_type, approval_date, exclusivity_expiration, raw_row), epa_biotech_submissions (case_number, submission_type, received_date, organism, submitter, interim_status, disposition, effective_date, source_url). Only SELECT queries are allowed.",
+    "Run a read-only SQL query against the regulatory database. Tables: applications (application_number, sponsor_name, application_type, brand_name, generic_name, manufacturer_name, substance_name, pharm_class, route), products (application_number, marketing_status, dosage_form, active_ingredients), submissions (application_number, submission_type, submission_number, submission_status, submission_status_date, submission_class_code_description, submission_public_notes), complete_response_letters (application_number, letter_date, company_name, letter_type, letter_text, approver_name), federal_register (document_number, title, doc_type, abstract, publication_date, html_url, agencies), usda_permits (permit_number, status, organism, phenotype, developer, permit_type, release_type, effective_date, state), purple_book (bla_number, proprietary_name, proper_name, applicant, dosage_form, route, strength, marketing_status, license_type, approval_date, exclusivity_expiration, raw_row), epa_biotech_submissions (case_number, submission_type, received_date, organism, submitter, interim_status, disposition, effective_date, source_url), signal_events (document_number, agency, type, title, abstract, publication_date, url, classification, score_delta, rationale), signal_readings (reading_date, track, value). Only SELECT queries are allowed.",
     {
       sql: z.string().describe("A SELECT SQL query"),
     },
